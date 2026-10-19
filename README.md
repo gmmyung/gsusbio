@@ -4,11 +4,11 @@ Rust sockets for GS-USB Classic CAN and CAN FD adapters on Linux, macOS, and Win
 
 ## Quick start
 
-Add the repository to your application:
+Add the crate to your application:
 
 ```toml
 [dependencies]
-gsusbio = { git = "https://github.com/gmmyung/gsusbio" }
+gsusbio = "0.1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -52,7 +52,7 @@ For a blocking application without Tokio:
 
 ```toml
 [dependencies]
-gsusbio = { git = "https://github.com/gmmyung/gsusbio", default-features = false, features = ["blocking"] }
+gsusbio = { version = "0.1.0", default-features = false, features = ["blocking"] }
 ```
 
 Use `gsusbio::blocking::CanSocket`; see [the blocking example](examples/blocking.rs). Add `can-fd` to the feature list when you need FD frames.
@@ -123,7 +123,7 @@ cargo test --no-default-features
 cargo doc --all-features --no-deps
 ```
 
-GitHub Actions runs these checks on Linux, macOS, and Windows where applicable. See [releasing](docs/RELEASING.md) for the one-time crates.io setup and automated publishing from GitHub Releases.
+GitHub Actions runs these checks on Linux, macOS, and Windows where applicable. See [releasing](docs/RELEASING.md) for automated publishing from GitHub Releases.
 
 ## Acknowledgements
 
