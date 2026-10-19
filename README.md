@@ -122,3 +122,7 @@ cargo test --all-features --all-targets
 cargo test --no-default-features
 cargo doc --all-features --no-deps
 ```
+
+## Acknowledgements
+
+This crate builds on [Maksim Drachov's Rust GS-USB implementation](https://github.com/maksimdrachov/gs_usb_rs), which was based on the [Python gs_usb library](https://github.com/jxltom/gs_usb). The socket API was informed by [slcanio](https://github.com/gmmyung/slcanio), and USB access is provided by [nusb](https://github.com/kevinmehall/nusb).
