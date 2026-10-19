@@ -1,3 +1,0 @@
-[submodule "lib/gs_usb"]
-	path = lib/gs_usb
-	url = git@github.com:maksimdrachov/gs_usb.git

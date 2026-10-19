@@ -1,119 +1,74 @@
-//! GS-USB Protocol Implementation for Rust
+//! Cross-platform GS-USB Classic CAN and CAN FD sockets backed by nusb.
 //!
-//! This crate provides a Rust implementation of the GS-USB protocol for communicating
-//! with CAN bus adapters like candleLight, CANable, and other GS-USB compatible devices.
+//! The default `tokio` feature provides `CanSocket` with a cloneable sender
+//! and an exclusive receiver. Enable `blocking` for `blocking::CanSocket`.
+//! Both APIs use nusb; neither requires libusb.
 //!
-//! # Features
-//!
-//! - Support for classic CAN (up to 1 Mbps)
-//! - Support for CAN FD (up to 10 Mbps data rate)
-//! - Hardware timestamps
-//! - Multiple operating modes (normal, listen-only, loopback, one-shot)
-//! - Device state and error counter monitoring
-//!
-//! # Example
+//! Discover a supported adapter, configure a channel, and connect:
 //!
 //! ```no_run
-//! use gs_usb::{GsUsb, GsUsbFrame, GS_CAN_MODE_NORMAL, GS_CAN_MODE_HW_TIMESTAMP};
-//! use std::time::Duration;
+//! # #[cfg(feature = "tokio")]
+//! # {
+//! use gsusbio::{Bitrate, CanFrame, CanId, CanSocket, Error, Result};
 //!
-//! fn main() -> gs_usb::Result<()> {
-//!     // Scan for devices
-//!     let devices = GsUsb::scan()?;
-//!     if devices.is_empty() {
-//!         println!("No GS-USB device found");
-//!         return Ok(());
-//!     }
-//!
-//!     let mut dev = devices.into_iter().next().unwrap();
-//!
-//!     // Configure bitrate (250 kbps)
-//!     dev.set_bitrate(250000)?;
-//!
-//!     // Start the device
-//!     dev.start(GS_CAN_MODE_NORMAL | GS_CAN_MODE_HW_TIMESTAMP)?;
-//!
-//!     // Send a frame
-//!     let data = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
-//!     let frame = GsUsbFrame::with_data(0x7FF, &data);
-//!     dev.send(&frame)?;
-//!
-//!     // Read frames
-//!     loop {
-//!         match dev.read(Duration::from_millis(100)) {
-//!             Ok(frame) => println!("RX  {}", frame),
-//!             Err(gs_usb::GsUsbError::ReadTimeout) => continue,
-//!             Err(e) => return Err(e),
-//!         }
-//!     }
+//! # async fn example() -> Result<()> {
+//! let device = CanSocket::scan().await?.into_iter().next().ok_or(Error::DeviceNotFound)?;
+//! let socket = CanSocket::builder(device)
+//!     .nominal_bitrate(Bitrate::Kbps500)
+//!     .connect()
+//!     .await?;
+//! let (tx, mut rx) = socket.split();
+//! tx.send(CanFrame::classic(CanId::standard(0x123)?, &[1, 2, 3])?).await?;
+//! if let Some(received) = rx.recv().await? {
+//!     println!("{:?}", received.frame);
 //! }
+//! # Ok(())
+//! # }
+//! # }
 //! ```
 //!
-//! # Supported Devices
-//!
-//! - GS-USB devices (VID: 0x1D50, PID: 0x606F)
-//! - candleLight (VID: 0x1209, PID: 0x2323)
-//! - CES CANext FD (VID: 0x1CD2, PID: 0x606F)
-//! - ABE CANdebugger FD (VID: 0x16D0, PID: 0x10B8)
+//! `send()` completes after a USB write, without waiting for CAN bus
+//! acknowledgment. `recv_event()` exposes adapter overflow and CAN error
+//! frames in addition to data frames. See the repository's
+//! [API guide](https://github.com/gmmyung/gsusbio/blob/master/docs/API.md)
+//! and [USB setup](https://github.com/gmmyung/gsusbio/blob/master/docs/USB_SETUP.md)
+//! for configuration and device access details.
 
-pub mod constants;
-pub mod device;
-pub mod error;
-pub mod frame;
-pub mod structures;
+mod can;
+#[allow(dead_code)]
+mod config;
+#[allow(dead_code)]
+mod constants;
+#[cfg(feature = "blocking")]
+#[allow(dead_code)]
+mod device;
+#[cfg(any(feature = "tokio", feature = "blocking"))]
+mod discovery;
+#[allow(dead_code)]
+mod error;
+#[allow(dead_code)]
+mod frame;
+mod received;
+mod socket_error;
+#[allow(dead_code)]
+mod structures;
+#[allow(dead_code)]
+mod timing;
 
-// Re-export main types at crate root
-pub use constants::{
-    // CAN ID flags
-    CAN_EFF_FLAG,
-    // CAN ID masks
-    CAN_EFF_MASK,
-    CAN_ERR_FLAG,
-    CAN_ERR_MASK,
-    CAN_RTR_FLAG,
-    CAN_SFF_MASK,
-    // Feature flags
-    GS_CAN_FEATURE_BERR_REPORTING,
-    GS_CAN_FEATURE_BT_CONST_EXT,
-    GS_CAN_FEATURE_FD,
-    GS_CAN_FEATURE_GET_STATE,
-    GS_CAN_FEATURE_HW_TIMESTAMP,
-    GS_CAN_FEATURE_IDENTIFY,
-    GS_CAN_FEATURE_LISTEN_ONLY,
-    GS_CAN_FEATURE_LOOP_BACK,
-    GS_CAN_FEATURE_ONE_SHOT,
-    GS_CAN_FEATURE_PAD_PKTS_TO_MAX_PKT_SIZE,
-    GS_CAN_FEATURE_REQ_USB_QUIRK_LPC546XX,
-    GS_CAN_FEATURE_TERMINATION,
-    GS_CAN_FEATURE_TRIPLE_SAMPLE,
-    GS_CAN_FEATURE_USER_ID,
-    // Frame flags
-    GS_CAN_FLAG_BRS,
-    GS_CAN_FLAG_ESI,
-    GS_CAN_FLAG_FD,
-    GS_CAN_FLAG_OVERFLOW,
-    // Mode flags
-    GS_CAN_MODE_BERR_REPORTING,
-    GS_CAN_MODE_FD,
-    GS_CAN_MODE_HW_TIMESTAMP,
-    GS_CAN_MODE_IDENTIFY,
-    GS_CAN_MODE_LISTEN_ONLY,
-    GS_CAN_MODE_LOOP_BACK,
-    GS_CAN_MODE_NORMAL,
-    GS_CAN_MODE_ONE_SHOT,
-    GS_CAN_MODE_PAD_PKTS_TO_MAX_PKT_SIZE,
-    GS_CAN_MODE_TRIPLE_SAMPLE,
-    GS_CAN_MODE_USER_ID,
-    // CAN state constants
-    GS_CAN_STATE_BUS_OFF,
-    GS_CAN_STATE_ERROR_ACTIVE,
-    GS_CAN_STATE_ERROR_PASSIVE,
-    GS_CAN_STATE_ERROR_WARNING,
-    GS_CAN_STATE_SLEEPING,
-    GS_CAN_STATE_STOPPED,
-};
+#[cfg(feature = "tokio")]
+mod socket;
+#[cfg(feature = "tokio")]
+mod usb_async;
 
-pub use device::GsUsb;
-pub use error::{GsUsbError, Result};
-pub use frame::GsUsbFrame;
-pub use structures::{DeviceBitTiming, DeviceCapability, DeviceInfo, DeviceMode, DeviceState};
+#[cfg(feature = "blocking")]
+pub mod blocking;
+
+pub use can::{CanFrame, CanId};
+pub use config::{Bitrate, CanMode, OverflowPolicy};
+#[cfg(any(feature = "tokio", feature = "blocking"))]
+pub use discovery::DiscoveredDevice;
+pub use received::{ReceiveEvent, ReceivedFrame};
+pub use socket_error::{Error, Result};
+
+#[cfg(feature = "tokio")]
+pub use socket::{CanReceiver, CanSender, CanSocket, CanSocketBuilder, Stats};

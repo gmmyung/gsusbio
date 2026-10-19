@@ -1,38 +1,48 @@
 [package]
-name = "gs_usb"
-version = "0.1.1"
+name = "gsusbio"
+version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 authors = ["Maksim"]
-description = "GS-USB protocol implementation for CAN adapters"
+description = "Cross-platform async GS-USB CAN and CAN FD sockets"
 license = "MIT"
-repository = "https://github.com/maksimdrachov/gs_usb_rs"
+repository = "https://github.com/gmmyung/gsusbio"
 keywords = ["can", "usb", "gs_usb", "candlelight", "canbus"]
 categories = ["hardware-support", "embedded"]
 
+[features]
+default = ["tokio", "can-fd"]
+tokio = ["dep:tokio", "nusb/tokio"]
+blocking = []
+can-fd = []
+
 [dependencies]
-rusb = "0.9"
+arrayvec = "0.7"
+nusb = "0.2.8"
 thiserror = "1.0"
 log = "0.4"
+tokio = { version = "1", optional = true, features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
 env_logger = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [[example]]
-name = "gs_usb_example"
-path = "examples/gs_usb_example.rs"
+name = "classic"
+path = "examples/classic.rs"
+required-features = ["tokio"]
 
 [[example]]
-name = "device_initialization"
-path = "examples/1_device_initialization.rs"
+name = "fd"
+path = "examples/fd.rs"
+required-features = ["tokio", "can-fd"]
 
 [[example]]
-name = "channel_start_sequence"
-path = "examples/2_channel_start_sequence.rs"
+name = "blocking"
+path = "examples/blocking.rs"
+required-features = ["blocking"]
 
 [[example]]
-name = "test_all_bitrates"
-path = "examples/3_test_all_bitrates.rs"
-
-[[example]]
-name = "test_get_state"
-path = "examples/4_test_get_state.rs"
+name = "loopback"
+path = "examples/loopback.rs"
+required-features = ["tokio", "can-fd"]

@@ -11,9 +11,9 @@ pub type Result<T> = std::result::Result<T, GsUsbError>;
 /// Error types for GS-USB operations
 #[derive(Error, Debug)]
 pub enum GsUsbError {
-    /// USB error from the rusb library
+    /// USB device or interface error from nusb
     #[error("USB error: {0}")]
-    Usb(#[from] rusb::Error),
+    Usb(#[from] nusb::Error),
 
     /// No GS-USB device found
     #[error("No GS-USB device found")]
@@ -25,11 +25,7 @@ pub enum GsUsbError {
 
     /// Failed to claim interface
     #[error("Failed to claim USB interface: {0}")]
-    ClaimInterface(rusb::Error),
-
-    /// Failed to detach kernel driver
-    #[error("Failed to detach kernel driver: {0}")]
-    DetachKernelDriver(rusb::Error),
+    ClaimInterface(nusb::Error),
 
     /// Unsupported bitrate for the device clock
     #[error("Unsupported bitrate {bitrate} for clock {clock_hz} Hz")]
@@ -61,11 +57,23 @@ pub enum GsUsbError {
 
     /// Control transfer failed
     #[error("Control transfer failed: {0}")]
-    ControlTransfer(rusb::Error),
+    ControlTransfer(nusb::transfer::TransferError),
 
     /// Bulk transfer failed
     #[error("Bulk transfer failed: {0}")]
-    BulkTransfer(rusb::Error),
+    BulkTransfer(nusb::transfer::TransferError),
+
+    /// A USB write completed without transferring the whole frame
+    #[error("Incomplete USB write: expected {expected} bytes, wrote {actual}")]
+    IncompleteWrite { expected: usize, actual: usize },
+
+    /// Invalid CAN frame or malformed wire data
+    #[error("Invalid CAN frame: {0}")]
+    InvalidFrame(&'static str),
+
+    /// Requested mode flags cannot be enabled
+    #[error("Unsupported mode flags: 0x{unsupported:08x}")]
+    UnsupportedModeFlags { unsupported: u32 },
 
     /// Device is already started
     #[error("Device is already started")]
@@ -91,7 +99,7 @@ impl GsUsbError {
             self,
             GsUsbError::ReadTimeout
                 | GsUsbError::WriteTimeout
-                | GsUsbError::Usb(rusb::Error::Timeout)
+                | GsUsbError::ControlTransfer(nusb::transfer::TransferError::Cancelled)
         )
     }
 
@@ -101,7 +109,6 @@ impl GsUsbError {
             self,
             GsUsbError::Usb(_)
                 | GsUsbError::ClaimInterface(_)
-                | GsUsbError::DetachKernelDriver(_)
                 | GsUsbError::ControlTransfer(_)
                 | GsUsbError::BulkTransfer(_)
         )

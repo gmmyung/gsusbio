@@ -5,54 +5,29 @@
 
 use std::time::Duration;
 
-use rusb::{DeviceHandle, GlobalContext};
+use nusb::transfer::{
+    Buffer, Bulk, ControlIn, ControlOut, ControlType, In, Out, Recipient, TransferError,
+};
+use nusb::{Device, DeviceInfo as UsbDeviceInfo, Endpoint, Interface, MaybeFuture};
 
 use crate::constants::*;
 use crate::error::{GsUsbError, Result};
 use crate::frame::GsUsbFrame;
 use crate::structures::{DeviceBitTiming, DeviceCapability, DeviceInfo, DeviceMode, DeviceState};
+use crate::timing::calculate_bittiming;
 
 /// GS-USB device handle
 ///
 /// Provides methods for interacting with GS-USB compatible CAN adapters.
 ///
-/// # Example
-///
-/// ```no_run
-/// use gs_usb::{GsUsb, GsUsbFrame};
-///
-/// // Scan for devices
-/// let devices = GsUsb::scan()?;
-/// if devices.is_empty() {
-///     println!("No GS-USB device found");
-///     return Ok(());
-/// }
-///
-/// let mut dev = devices.into_iter().next().unwrap();
-///
-/// // Configure bitrate
-/// dev.set_bitrate(250000)?;
-///
-/// // Start the device
-/// dev.start(gs_usb::GS_CAN_MODE_NORMAL | gs_usb::GS_CAN_MODE_HW_TIMESTAMP)?;
-///
-/// // Send a frame
-/// let frame = GsUsbFrame::with_data(0x123, &[0x01, 0x02, 0x03, 0x04]);
-/// dev.send(&frame)?;
-///
-/// // Read frames
-/// loop {
-///     match dev.read(std::time::Duration::from_millis(100)) {
-///         Ok(frame) => println!("RX: {}", frame),
-///         Err(gs_usb::GsUsbError::ReadTimeout) => continue,
-///         Err(e) => return Err(e),
-///     }
-/// }
-/// # Ok::<(), gs_usb::GsUsbError>(())
-/// ```
 pub struct GsUsb {
     /// USB device handle
-    handle: DeviceHandle<GlobalContext>,
+    handle: Device,
+    usb_info: UsbDeviceInfo,
+    interface: Option<Interface>,
+    endpoint_in: Option<Endpoint<Bulk, In>>,
+    endpoint_out: Option<Endpoint<Bulk, Out>>,
+    host_format_attempted: bool,
     /// Cached device capability
     capability: Option<DeviceCapability>,
     /// Current device flags
@@ -65,6 +40,8 @@ pub struct GsUsb {
     bus: u8,
     /// USB device address
     address: u8,
+    /// Selected CAN channel
+    channel: u16,
     /// Device serial number (cached)
     serial_number: Option<String>,
     /// Last nominal (arbitration) phase bit timing that was set
@@ -75,19 +52,36 @@ pub struct GsUsb {
 
 impl GsUsb {
     /// Create a new GsUsb from a USB device handle
-    fn new(handle: DeviceHandle<GlobalContext>, bus: u8, address: u8) -> Self {
+    fn new(handle: Device, usb_info: UsbDeviceInfo) -> Self {
+        let bus = Self::bus_number(&usb_info);
+        let address = usb_info.device_address();
         Self {
             handle,
+            usb_info,
+            interface: None,
+            endpoint_in: None,
+            endpoint_out: None,
+            host_format_attempted: false,
             capability: None,
             device_flags: 0,
             fd_mode: false,
             started: false,
             bus,
             address,
+            channel: 0,
             serial_number: None,
             last_timing: None,
             last_data_timing: None,
         }
+    }
+
+    pub(crate) fn open_info(usb_info: UsbDeviceInfo) -> Result<Self> {
+        let handle = usb_info.open().wait()?;
+        Ok(Self::new(handle, usb_info))
+    }
+
+    pub(crate) fn select_channel(&mut self, channel: u8) {
+        self.channel = u16::from(channel);
     }
 
     /// Start the GS-USB device
@@ -95,73 +89,59 @@ impl GsUsb {
     /// # Arguments
     /// * `flags` - Mode flags (combination of GS_CAN_MODE_* constants)
     ///
-    /// # Example
-    /// ```no_run
-    /// # use gs_usb::GsUsb;
-    /// # let mut dev: GsUsb = todo!();
-    /// // Start with hardware timestamps and normal mode
-    /// dev.start(gs_usb::GS_CAN_MODE_NORMAL | gs_usb::GS_CAN_MODE_HW_TIMESTAMP)?;
-    /// # Ok::<(), gs_usb::GsUsbError>(())
-    /// ```
     pub fn start(&mut self, flags: u32) -> Result<()> {
-        // Reset to support restart multiple times
-        self.handle.reset()?;
-
-        // Detach kernel driver on Linux/Unix
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            if self.handle.kernel_driver_active(0).unwrap_or(false) {
-                self.handle
-                    .detach_kernel_driver(0)
-                    .map_err(GsUsbError::DetachKernelDriver)?;
-            }
+        if self.started {
+            return Err(GsUsbError::AlreadyStarted);
         }
-
-        // Claim the interface
-        self.handle
-            .claim_interface(0)
-            .map_err(GsUsbError::ClaimInterface)?;
 
         // Get capability to check supported features
         let capability = self.device_capability()?;
-
-        // Only allow features that the device supports
-        let mut flags = flags & capability.feature;
-
-        // Only allow features that this driver supports
-        flags &= GS_CAN_MODE_LISTEN_ONLY
+        let driver_flags = GS_CAN_MODE_LISTEN_ONLY
             | GS_CAN_MODE_LOOP_BACK
+            | GS_CAN_MODE_TRIPLE_SAMPLE
             | GS_CAN_MODE_ONE_SHOT
             | GS_CAN_MODE_HW_TIMESTAMP
-            | GS_CAN_MODE_FD;
-
-        self.device_flags = flags;
-        self.fd_mode = (flags & GS_CAN_MODE_FD) == GS_CAN_MODE_FD;
+            | GS_CAN_MODE_IDENTIFY
+            | GS_CAN_MODE_USER_ID
+            | GS_CAN_MODE_PAD_PKTS_TO_MAX_PKT_SIZE
+            | GS_CAN_MODE_FD
+            | GS_CAN_MODE_BERR_REPORTING;
+        let unsupported = flags & !(capability.feature & driver_flags);
+        if unsupported != 0 {
+            return Err(GsUsbError::UnsupportedModeFlags { unsupported });
+        }
 
         let mode = DeviceMode::new(GS_CAN_MODE_START, flags);
-        self.control_out(GS_USB_BREQ_MODE, 0, &mode.pack())?;
+        self.control_out(GS_USB_BREQ_MODE, self.channel, &mode.pack())?;
 
+        self.device_flags = flags;
+        self.fd_mode = flags & GS_CAN_MODE_FD != 0;
         self.started = true;
         Ok(())
     }
 
     /// Stop the GS-USB device
     pub fn stop(&mut self) -> Result<()> {
+        if !self.started {
+            return Ok(());
+        }
         let mode = DeviceMode::new(GS_CAN_MODE_RESET, 0);
-        // Ignore errors when stopping (device might already be stopped)
-        let _ = self.control_out(GS_USB_BREQ_MODE, 0, &mode.pack());
+        self.control_out(GS_USB_BREQ_MODE, self.channel, &mode.pack())?;
         self.started = false;
+        self.device_flags = 0;
+        self.fd_mode = false;
         Ok(())
     }
 
     /// Set the CAN bitrate
     ///
-    /// Configures the nominal (arbitration) bitrate with a sample point of 87.5%.
+    /// Configures an exact nominal bitrate using the device's timing limits.
+    /// Prefers an 87.5% sample point below 1 Mbps and 75% at 1 Mbps or above.
     ///
     /// # Arguments
     /// * `bitrate` - Bitrate in bits per second (e.g., 250000 for 250 kbps)
     ///
-    /// # Supported bitrates
+    /// # Common target bitrates (subject to device timing limits)
     /// - 10000 (10 kbps)
     /// - 20000 (20 kbps)
     /// - 50000 (50 kbps)
@@ -173,46 +153,18 @@ impl GsUsb {
     /// - 1000000 (1 Mbps)
     pub fn set_bitrate(&mut self, bitrate: u32) -> Result<()> {
         let capability = self.device_capability()?;
-        let clock = capability.fclk_can;
-
-        // Get timing parameters based on clock
-        // Returns (prop_seg, phase_seg1, phase_seg2, sjw, brp)
-        // Sample points: 87.5% for 10-500 Kbps, 75% for 1 Mbps
-        let timing = match clock {
-            // 80 MHz clock (PEAK Systems)
-            80_000_000 => match bitrate {
-                10_000 => Some((87, 87, 25, 12, 40)),   // 87.5% sample point
-                20_000 => Some((87, 87, 25, 12, 20)),   // 87.5% sample point
-                50_000 => Some((87, 87, 25, 12, 8)),    // 87.5% sample point
-                100_000 => Some((87, 87, 25, 12, 4)),   // 87.5% sample point
-                125_000 => Some((69, 70, 20, 10, 4)),   // 87.5% sample point
-                250_000 => Some((69, 70, 20, 10, 2)),   // 87.5% sample point
-                500_000 => Some((69, 70, 20, 10, 1)),   // 87.5% sample point
-                1_000_000 => Some((29, 30, 20, 10, 1)), // 75% sample point
-                _ => None,
-            },
-            // 40 MHz clock (CF3 / candleLight)
-            40_000_000 => match bitrate {
-                10_000 => Some((87, 87, 25, 12, 20)),  // 87.5% sample point
-                20_000 => Some((87, 87, 25, 12, 10)),  // 87.5% sample point
-                50_000 => Some((87, 87, 25, 12, 4)),   // 87.5% sample point
-                100_000 => Some((87, 87, 25, 12, 2)),  // 87.5% sample point
-                125_000 => Some((69, 70, 20, 10, 2)),  // 87.5% sample point
-                250_000 => Some((69, 70, 20, 10, 1)),  // 87.5% sample point
-                500_000 => Some((34, 35, 10, 5, 1)),   // 87.5% sample point
-                1_000_000 => Some((14, 15, 10, 5, 1)), // 75% sample point
-                _ => None,
-            },
-            _ => None,
-        };
-
-        match timing {
-            Some((prop_seg, phase_seg1, phase_seg2, sjw, brp)) => {
-                self.set_timing(prop_seg, phase_seg1, phase_seg2, sjw, brp)
-            }
+        let sample_point = if bitrate >= 1_000_000 { 750 } else { 875 };
+        match calculate_bittiming(&capability, bitrate, false, sample_point) {
+            Some(timing) => self.set_timing(
+                timing.prop_seg,
+                timing.phase_seg1,
+                timing.phase_seg2,
+                timing.sjw,
+                timing.brp,
+            ),
             None => Err(GsUsbError::UnsupportedBitrate {
                 bitrate,
-                clock_hz: clock,
+                clock_hz: capability.fclk_can,
             }),
         }
     }
@@ -234,7 +186,7 @@ impl GsUsb {
         brp: u32,
     ) -> Result<()> {
         let timing = DeviceBitTiming::new(prop_seg, phase_seg1, phase_seg2, sjw, brp);
-        self.control_out(GS_USB_BREQ_BITTIMING, 0, &timing.pack())?;
+        self.control_out(GS_USB_BREQ_BITTIMING, self.channel, &timing.pack())?;
         self.last_timing = Some(timing);
         Ok(())
     }
@@ -249,7 +201,7 @@ impl GsUsb {
         brp: u32,
     ) -> Result<()> {
         let timing = DeviceBitTiming::new(prop_seg, phase_seg1, phase_seg2, sjw, brp);
-        self.control_out(GS_USB_BREQ_DATA_BITTIMING, 0, &timing.pack())?;
+        self.control_out(GS_USB_BREQ_DATA_BITTIMING, self.channel, &timing.pack())?;
         self.last_data_timing = Some(timing);
         Ok(())
     }
@@ -266,7 +218,7 @@ impl GsUsb {
 
     /// Set CAN FD data phase bitrate
     ///
-    /// Common data bitrates: 1 Mbps, 2 Mbps, 5 Mbps, 8 Mbps, 10 Mbps
+    /// Configures an exact data bitrate with a preferred 75% sample point.
     ///
     /// # Arguments
     /// * `bitrate` - Data phase bitrate in bits per second
@@ -278,40 +230,18 @@ impl GsUsb {
             return Err(GsUsbError::FdNotSupported);
         }
 
-        let clock = capability.fclk_can;
-
-        // Get timing parameters based on clock
-        // Returns (prop_seg, phase_seg1, phase_seg2, sjw, brp)
-        // Sample points: 75% for most bitrates, 70% for 8 Mbps @ 80 MHz, 60% for 8 Mbps @ 40 MHz
-        let timing = match clock {
-            // 80 MHz clock (PEAK Systems)
-            80_000_000 => match bitrate {
-                1_000_000 => Some((14, 15, 10, 5, 2)), // 75% sample point
-                2_000_000 => Some((14, 15, 10, 5, 1)), // 75% sample point
-                5_000_000 => Some((5, 6, 4, 2, 1)),    // 75% sample point
-                8_000_000 => Some((3, 3, 3, 1, 1)),    // 70% sample point
-                10_000_000 => Some((2, 3, 2, 1, 1)),   // 75% sample point
-                _ => None,
-            },
-            // 40 MHz clock (CF3 / candleLight)
-            40_000_000 => match bitrate {
-                1_000_000 => Some((14, 15, 10, 5, 1)), // 75% sample point
-                2_000_000 => Some((7, 7, 5, 2, 1)),    // 75% sample point
-                5_000_000 => Some((2, 3, 2, 1, 1)),    // 75% sample point
-                8_000_000 => Some((1, 1, 2, 1, 1)),    // 60% sample point
-                10_000_000 => Some((1, 1, 1, 1, 1)),   // 75% sample point
-                _ => None,
-            },
-            _ => None,
-        };
-
-        match timing {
-            Some((prop_seg, phase_seg1, phase_seg2, sjw, brp)) => {
-                self.set_data_timing(prop_seg, phase_seg1, phase_seg2, sjw, brp)
-            }
+        let capability = self.device_capability_extended()?.unwrap_or(capability);
+        match calculate_bittiming(&capability, bitrate, true, 750) {
+            Some(timing) => self.set_data_timing(
+                timing.prop_seg,
+                timing.phase_seg1,
+                timing.phase_seg2,
+                timing.sjw,
+                timing.brp,
+            ),
             None => Err(GsUsbError::UnsupportedDataBitrate {
                 bitrate,
-                clock_hz: clock,
+                clock_hz: capability.fclk_can,
             }),
         }
     }
@@ -321,14 +251,31 @@ impl GsUsb {
     /// # Arguments
     /// * `frame` - The CAN frame to send
     pub fn send(&mut self, frame: &GsUsbFrame) -> Result<()> {
-        let hw_timestamps = (self.device_flags & GS_CAN_MODE_HW_TIMESTAMP) != 0;
-        let data = frame.pack(hw_timestamps, self.fd_mode);
-
-        self.handle
-            .write_bulk(GS_USB_ENDPOINT_OUT, &data, Duration::from_millis(1000))
-            .map_err(GsUsbError::BulkTransfer)?;
-
-        Ok(())
+        if !self.started {
+            return Err(GsUsbError::NotStarted);
+        }
+        let data = frame.pack_for_tx(self.fd_mode)?;
+        let expected_len = data.len();
+        if self.endpoint_out.is_none() {
+            let endpoint = self
+                .ensure_interface()?
+                .endpoint::<Bulk, Out>(GS_USB_ENDPOINT_OUT)?;
+            self.endpoint_out = Some(endpoint);
+        }
+        let completion = self
+            .endpoint_out
+            .as_mut()
+            .unwrap()
+            .transfer_blocking(data.into(), Duration::from_millis(1000));
+        match completion.status {
+            Ok(()) if completion.actual_len == expected_len => Ok(()),
+            Ok(()) => Err(GsUsbError::IncompleteWrite {
+                expected: expected_len,
+                actual: completion.actual_len,
+            }),
+            Err(TransferError::Cancelled) => Err(GsUsbError::WriteTimeout),
+            Err(e) => Err(GsUsbError::BulkTransfer(e)),
+        }
     }
 
     /// Read a CAN frame
@@ -339,15 +286,35 @@ impl GsUsb {
     /// # Returns
     /// The received CAN frame, or an error if timeout or other failure
     pub fn read(&mut self, timeout: Duration) -> Result<GsUsbFrame> {
+        if !self.started {
+            return Err(GsUsbError::NotStarted);
+        }
         let hw_timestamps = (self.device_flags & GS_CAN_MODE_HW_TIMESTAMP) != 0;
         let max_size = GsUsbFrame::frame_size(hw_timestamps, self.fd_mode);
-
-        let mut buf = vec![0u8; max_size];
-        let len = match self.handle.read_bulk(GS_USB_ENDPOINT_IN, &mut buf, timeout) {
-            Ok(len) => len,
-            Err(rusb::Error::Timeout) => return Err(GsUsbError::ReadTimeout),
+        if self.endpoint_in.is_none() {
+            let endpoint = self
+                .ensure_interface()?
+                .endpoint::<Bulk, In>(GS_USB_ENDPOINT_IN)?;
+            self.endpoint_in = Some(endpoint);
+        }
+        let endpoint = self.endpoint_in.as_mut().unwrap();
+        // nusb requires IN requests to be a multiple of the endpoint packet
+        // size. A single GS-USB frame still ends with a short USB packet.
+        let packet_size = endpoint.max_packet_size();
+        if packet_size == 0 {
+            return Err(GsUsbError::InvalidFrame(
+                "USB endpoint has zero packet size",
+            ));
+        }
+        let request_size = max_size.div_ceil(packet_size) * packet_size;
+        let completion = endpoint.transfer_blocking(Buffer::new(request_size), timeout);
+        match completion.status {
+            Ok(()) => {}
+            Err(TransferError::Cancelled) => return Err(GsUsbError::ReadTimeout),
             Err(e) => return Err(GsUsbError::BulkTransfer(e)),
-        };
+        }
+        let buf = completion.buffer;
+        let len = completion.actual_len;
 
         // Determine if this is an FD frame by checking the flags byte (offset 10)
         let is_fd_frame = if len >= 11 {
@@ -356,16 +323,18 @@ impl GsUsb {
             false
         };
 
-        Ok(GsUsbFrame::from_bytes(
-            &buf[..len],
-            hw_timestamps,
-            is_fd_frame,
-        ))
+        GsUsbFrame::from_bytes(&buf[..len], hw_timestamps, is_fd_frame)
     }
 
-    /// Get the USB bus number
+    /// Get the numeric USB bus number. On non-Linux platforms, use `bus_id`
+    /// because the OS may not expose a numeric bus number.
     pub fn bus(&self) -> u8 {
         self.bus
+    }
+
+    /// Get the OS-provided USB bus identifier.
+    pub fn bus_id(&self) -> &str {
+        self.usb_info.bus_id()
     }
 
     /// Get the USB device address
@@ -379,18 +348,13 @@ impl GsUsb {
             return Ok(sn.clone());
         }
 
-        let device = self.handle.device();
-        let desc = device.device_descriptor()?;
-
-        if desc.serial_number_string_index().is_some() {
-            let sn = self
-                .handle
-                .read_string_descriptor_ascii(desc.serial_number_string_index().unwrap())?;
-            self.serial_number = Some(sn.clone());
-            Ok(sn)
-        } else {
-            Ok(String::new())
-        }
+        let sn = self
+            .usb_info
+            .get_serial_number_string()
+            .wait()?
+            .unwrap_or_default();
+        self.serial_number = Some(sn.clone());
+        Ok(sn)
     }
 
     /// Get device information (channel count, firmware/hardware version)
@@ -467,45 +431,95 @@ impl GsUsb {
     /// don't require this, but it's included for compatibility.
     pub fn send_host_format(&mut self) -> Result<()> {
         let host_format: [u8; 4] = 0x0000_BEEFu32.to_le_bytes();
-        // Ignore errors - this may fail on some devices that don't support it
-        let _ = self.control_out(GS_USB_BREQ_HOST_FORMAT, 0, &host_format);
+        let interface = self.ensure_interface()?;
+        interface
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Interface,
+                    request: GS_USB_BREQ_HOST_FORMAT,
+                    value: 0,
+                    index: 0,
+                    data: &host_format,
+                },
+                Duration::from_millis(1000),
+            )
+            .wait()
+            .map_err(GsUsbError::ControlTransfer)?;
+        self.host_format_attempted = true;
         Ok(())
     }
 
+    fn ensure_interface(&mut self) -> Result<&Interface> {
+        if self.interface.is_none() {
+            let interface = self
+                .handle
+                .detach_and_claim_interface(0)
+                .wait()
+                .map_err(GsUsbError::ClaimInterface)?;
+            self.interface = Some(interface);
+        }
+        Ok(self.interface.as_ref().unwrap())
+    }
+
+    fn ensure_host_format(&mut self) -> Result<()> {
+        if self.host_format_attempted {
+            return Ok(());
+        }
+        match self.send_host_format() {
+            Ok(()) => Ok(()),
+            // candleLight and some compatible firmware omit this legacy request.
+            Err(GsUsbError::ControlTransfer(TransferError::Stall)) => {
+                self.host_format_attempted = true;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Perform a control OUT transfer
-    fn control_out(&self, request: u8, value: u16, data: &[u8]) -> Result<()> {
-        self.handle
-            .write_control(
-                0x41, // bmRequestType: vendor, host-to-device
-                request,
-                value,
-                0, // wIndex
-                data,
+    fn control_out(&mut self, request: u8, value: u16, data: &[u8]) -> Result<()> {
+        self.ensure_host_format()?;
+        self.ensure_interface()?
+            .control_out(
+                ControlOut {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Interface,
+                    request,
+                    value,
+                    index: 0,
+                    data,
+                },
                 Duration::from_millis(1000),
             )
+            .wait()
             .map_err(GsUsbError::ControlTransfer)?;
         Ok(())
     }
 
     /// Perform a control IN transfer
-    fn control_in(&self, request: u8, value: u16, length: usize) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; length];
-        let len = self
-            .handle
-            .read_control(
-                0xC1, // bmRequestType: vendor, device-to-host
-                request,
-                value,
-                0, // wIndex
-                &mut buf,
+    fn control_in(&mut self, request: u8, value: u16, length: usize) -> Result<Vec<u8>> {
+        self.ensure_host_format()?;
+        let buf = self
+            .ensure_interface()?
+            .control_in(
+                ControlIn {
+                    control_type: ControlType::Vendor,
+                    recipient: Recipient::Interface,
+                    request,
+                    value,
+                    index: 0,
+                    length: length as u16,
+                },
                 Duration::from_millis(1000),
             )
+            .wait()
             .map_err(GsUsbError::ControlTransfer)?;
 
-        if len < length {
+        if buf.len() != length {
             return Err(GsUsbError::InvalidResponse {
                 expected: length,
-                actual: len,
+                actual: buf.len(),
             });
         }
 
@@ -513,7 +527,7 @@ impl GsUsb {
     }
 
     /// Check if a USB device is a GS-USB device
-    fn is_gs_usb_device(vendor_id: u16, product_id: u16) -> bool {
+    pub(crate) fn is_gs_usb_device(vendor_id: u16, product_id: u16) -> bool {
         matches!(
             (vendor_id, product_id),
             (GS_USB_ID_VENDOR, GS_USB_ID_PRODUCT)
@@ -529,68 +543,77 @@ impl GsUsb {
         )
     }
 
+    fn bus_number(info: &UsbDeviceInfo) -> u8 {
+        #[cfg(target_os = "linux")]
+        {
+            info.busnum()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            info.bus_id().parse().unwrap_or(0)
+        }
+    }
+
     /// Scan for GS-USB devices
     ///
     /// Returns a list of all connected GS-USB compatible devices.
     pub fn scan() -> Result<Vec<GsUsb>> {
         let mut devices = Vec::new();
 
-        for device in rusb::devices()?.iter() {
-            let desc = match device.device_descriptor() {
-                Ok(desc) => desc,
-                Err(_) => continue,
-            };
-
-            if Self::is_gs_usb_device(desc.vendor_id(), desc.product_id()) {
-                let handle = match device.open() {
+        for info in nusb::list_devices().wait()? {
+            if Self::is_gs_usb_device(info.vendor_id(), info.product_id()) {
+                let handle = match info.open().wait() {
                     Ok(handle) => handle,
                     Err(_) => continue,
                 };
-
-                devices.push(GsUsb::new(handle, device.bus_number(), device.address()));
+                devices.push(GsUsb::new(handle, info));
             }
         }
 
         Ok(devices)
     }
 
-    /// Find a specific GS-USB device by bus and address
+    /// Find a specific GS-USB device by numeric bus and address.
+    /// `find_by_bus_id` is portable across platforms.
     pub fn find(bus: u8, address: u8) -> Result<Option<GsUsb>> {
-        for device in rusb::devices()?.iter() {
-            if device.bus_number() != bus || device.address() != address {
+        for info in nusb::list_devices().wait()? {
+            if Self::bus_number(&info) != bus || info.device_address() != address {
                 continue;
             }
-
-            let desc = match device.device_descriptor() {
-                Ok(desc) => desc,
-                Err(_) => continue,
-            };
-
-            if Self::is_gs_usb_device(desc.vendor_id(), desc.product_id()) {
-                let handle = device.open()?;
-                return Ok(Some(GsUsb::new(handle, bus, address)));
+            if Self::is_gs_usb_device(info.vendor_id(), info.product_id()) {
+                let handle = info.open().wait()?;
+                return Ok(Some(GsUsb::new(handle, info)));
             }
         }
 
+        Ok(None)
+    }
+
+    /// Find a specific GS-USB device by OS bus identifier and address.
+    pub fn find_by_bus_id(bus_id: &str, address: u8) -> Result<Option<GsUsb>> {
+        for info in nusb::list_devices().wait()? {
+            if info.bus_id() != bus_id || info.device_address() != address {
+                continue;
+            }
+            if Self::is_gs_usb_device(info.vendor_id(), info.product_id()) {
+                let handle = info.open().wait()?;
+                return Ok(Some(GsUsb::new(handle, info)));
+            }
+        }
         Ok(None)
     }
 }
 
 impl std::fmt::Display for GsUsb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let device = self.handle.device();
-        if let Ok(desc) = device.device_descriptor() {
-            write!(
-                f,
-                "GS-USB {:04x}:{:04x} (bus {}, addr {})",
-                desc.vendor_id(),
-                desc.product_id(),
-                self.bus,
-                self.address
-            )
-        } else {
-            write!(f, "GS-USB (bus {}, addr {})", self.bus, self.address)
-        }
+        write!(
+            f,
+            "GS-USB {:04x}:{:04x} (bus {}, addr {})",
+            self.usb_info.vendor_id(),
+            self.usb_info.product_id(),
+            self.bus_id(),
+            self.address
+        )
     }
 }
 
@@ -608,7 +631,8 @@ impl std::fmt::Debug for GsUsb {
 
 impl Drop for GsUsb {
     fn drop(&mut self) {
-        // Try to stop the device when dropped
-        let _ = self.stop();
+        if self.started {
+            let _ = self.stop();
+        }
     }
 }

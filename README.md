@@ -1,251 +1,126 @@
-# gs_usb - GS-USB Protocol Implementation for Rust
+# gsusbio
 
-A Rust implementation of the GS-USB protocol for communicating with CAN bus adapters like candleLight, CANable, and other GS-USB compatible devices.
+Rust sockets for GS-USB Classic CAN and CAN FD adapters on Linux, macOS, and Windows. The USB backend is [nusb](https://docs.rs/nusb/0.2.8/nusb/). The default API uses Tokio; an optional blocking API uses the same backend.
 
-## Features
+**No libusb installation is required.** nusb uses each operating system's USB interface. USB device permissions or a suitable driver may still be needed; see [USB setup](docs/USB_SETUP.md).
 
-- **Classic CAN Support**: Up to 1 Mbps bitrate
-- **CAN FD Support**: Up to 10 Mbps data rate with flexible data length
-- **Hardware Timestamps**: Microsecond-precision timestamps from the device
-- **Multiple Operating Modes**: Normal, listen-only, loopback, and one-shot modes
-- **Device State Monitoring**: Error counters and bus state information
-- **Cross-Platform**: Works on Linux, macOS, and Windows
+## Quick start
 
-## Supported Devices
-
-- GS-USB devices (VID: 0x1D50, PID: 0x606F)
-- candleLight (VID: 0x1209, PID: 0x2323)
-- CES CANext FD (VID: 0x1CD2, PID: 0x606F)
-- ABE CANdebugger FD (VID: 0x16D0, PID: 0x10B8)
-
-## Installation
-
-Add this to your `Cargo.toml`:
+Add the repository to your application:
 
 ```toml
 [dependencies]
-gs_usb = "0.1.1"
+gsusbio = { git = "https://github.com/gmmyung/gsusbio" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
-
-### System Dependencies
-
-This crate requires libusb to be installed:
-
-**Linux (Debian/Ubuntu):**
-```bash
-sudo apt-get install libusb-1.0-0-dev
-```
-
-**Linux (Fedora):**
-```bash
-sudo dnf install libusb1-devel
-```
-
-**macOS:**
-```bash
-brew install libusb
-```
-
-**Windows:**
-Download and install libusb from https://libusb.info/
-
-## Quick Start
 
 ```rust
-use gs_usb::{GsUsb, GsUsbFrame, GS_CAN_MODE_NORMAL, GS_CAN_MODE_HW_TIMESTAMP};
-use std::time::Duration;
+use gsusbio::{Bitrate, CanFrame, CanId, CanSocket, Error, Result};
 
-fn main() -> gs_usb::Result<()> {
-    // Scan for devices
-    let devices = GsUsb::scan()?;
-    if devices.is_empty() {
-        println!("No GS-USB device found");
-        return Ok(());
+#[tokio::main]
+async fn main() -> Result<()> {
+    let device = CanSocket::scan().await?
+        .into_iter()
+        .next()
+        .ok_or(Error::DeviceNotFound)?;
+
+    let socket = CanSocket::builder(device)
+        .nominal_bitrate(Bitrate::Kbps500)
+        .connect()
+        .await?;
+
+    let (tx, mut rx) = socket.split();
+    tx.send(CanFrame::classic(CanId::standard(0x123)?, &[1, 2, 3])?).await?;
+
+    if let Some(received) = rx.recv().await? {
+        println!("{:?}", received.frame);
     }
-
-    let mut dev = devices.into_iter().next().unwrap();
-
-    // Configure bitrate (250 kbps)
-    dev.set_bitrate(250000)?;
-
-    // Start the device
-    dev.start(GS_CAN_MODE_NORMAL | GS_CAN_MODE_HW_TIMESTAMP)?;
-
-    // Send a frame
-    let data = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
-    let frame = GsUsbFrame::with_data(0x7FF, &data);
-    dev.send(&frame)?;
-
-    // Read frames
-    loop {
-        match dev.read(Duration::from_millis(100)) {
-            Ok(frame) => println!("RX  {}", frame),
-            Err(gs_usb::GsUsbError::ReadTimeout) => continue,
-            Err(e) => return Err(e),
-        }
-    }
+    tx.close().await
 }
 ```
 
-## Examples
+This example waits for a frame from the CAN bus. For a single adapter with no peer, run the [loopback example](#examples-and-validation). If several adapters are connected, select one by USB ID, bus, address, or serial number.
 
-Run the examples with:
+## Features
 
-```bash
-# Basic usage example
-cargo run --example gs_usb_example
+| Cargo feature | Provides |
+| --- | --- |
+| `tokio` (default) | Async socket, split sender and receiver, bounded queues |
+| `can-fd` (default) | CAN FD frames and data phase configuration |
+| `blocking` | Synchronous socket using nusb directly |
+| `default-features = false` | Runtime free Classic CAN frame model |
 
-# Device initialization sequence
-cargo run --example device_initialization
+For a blocking application without Tokio:
 
-# CAN FD channel start sequence
-cargo run --example channel_start_sequence
-
-# Test all supported bitrates
-cargo run --example test_all_bitrates
-
-# Test GET_STATE feature
-cargo run --example test_get_state
+```toml
+[dependencies]
+gsusbio = { git = "https://github.com/gmmyung/gsusbio", default-features = false, features = ["blocking"] }
 ```
 
-## Supported Bitrates
+Use `gsusbio::blocking::CanSocket`; see [the blocking example](examples/blocking.rs). Add `can-fd` to the feature list when you need FD frames.
 
-### Classic CAN (87.5% sample point)
+The scanner currently recognizes these USB IDs:
 
-| Bitrate | 80 MHz | 40 MHz |
-|---------|--------|--------|
-| 10 kbps | ✓ | ✓ |
-| 20 kbps | ✓ | ✓ |
-| 50 kbps | ✓ | ✓ |
-| 100 kbps | ✓ | ✓ |
-| 125 kbps | ✓ | ✓ |
-| 250 kbps | ✓ | ✓ |
-| 500 kbps | ✓ | ✓ |
-| 800 kbps | ✓ | ✓ |
-| 1 Mbps | ✓ | ✓ |
+| Adapter family | VID:PID |
+| --- | --- |
+| GS-USB / candleLight | `1d50:606f` |
+| candleLight | `1209:2323` |
+| CES CANext FD | `1cd2:606f` |
+| ABE CANdebugger FD | `16d0:10b8` |
 
-### CAN FD Data Phase (75% sample point)
+Capabilities vary by firmware. `connect()` checks channel count, requested modes, FD support, and bit timing against the selected device.
 
-| Data Bitrate | 80 MHz | 40 MHz |
-|--------------|--------|--------|
-| 2 Mbps | ✓ | ✓ |
-| 4 Mbps | ✓ | ✓ |
-| 5 Mbps | ✓ | ✓ |
-| 8 Mbps | ✓ | ✓ |
-| 10 Mbps | - | ✓ |
+## CAN FD
 
-## API Overview
-
-### Device Discovery
+Enable FD on the channel and set a data bitrate explicitly:
 
 ```rust
-// Scan for all GS-USB devices
-let devices = GsUsb::scan()?;
-
-// Find a specific device by bus and address
-let device = GsUsb::find(1, 5)?;
+# use gsusbio::{Bitrate, CanFrame, CanId, CanSocket, DiscoveredDevice, Result};
+# async fn example(device: DiscoveredDevice) -> Result<()> {
+let socket = CanSocket::builder(device)
+    .nominal_bitrate(Bitrate::Kbps500)
+    .data_bitrate(Bitrate::Mbps2)
+    .fd_enabled(true)
+    .connect()
+    .await?;
+socket.send(CanFrame::fd(CanId::extended(0x18ff_50e5)?, &[0x55; 12], true)?).await?;
+socket.close().await
+# }
 ```
 
-### Configuration
+The last argument to `CanFrame::fd` enables bit rate switching. Valid FD payload lengths are 0 through 8, then 12, 16, 20, 24, 32, 48, and 64 bytes. `Bitrate::Custom(bps)` requests an exact bitrate when the adapter's timing limits allow it.
 
-```rust
-// Set bitrate (classic CAN)
-dev.set_bitrate(500000)?;
+## Behavior
 
-// Set CAN FD data bitrate
-dev.set_data_bitrate(5000000)?;
+- `send()` completes after a full USB OUT transfer. It does not indicate CAN bus acknowledgment. A cancelled send already in the queue may still transmit.
+- `recv()` returns data frames. `recv_event()` also exposes CAN error frames and adapter overflow indications. The async receiver is cancellation safe and yields `Ok(None)` after an orderly close.
+- `CanSender` can be cloned for concurrent producers. A socket has one `CanReceiver`. Configure bounded RX and TX queues on the builder; RX overflow defaults to `DropNewest`.
+- `hardware_timestamps(true)` requests adapter timestamps. `ReceivedFrame::timestamp` is an optional 32 bit microsecond counter that can wrap.
+- `close()` processes earlier queued sends, resets the selected CAN channel, and ends the receive stream. The blocking API exposes `recv_with_metadata()` and a configurable timeout.
 
-// Set raw timing parameters
-dev.set_timing(prop_seg, phase_seg1, phase_seg2, sjw, brp)?;
+See the [API guide](docs/API.md) for the frame model, configuration defaults, events, statistics, and error behavior.
+
+## Examples and validation
+
+```sh
+cargo run --example loopback -- --matrix --timestamp --preflight
+cargo run --example classic
+cargo run --example fd
+cargo run --features blocking --example blocking
+cargo test --all-features --all-targets
+cargo test --no-default-features
 ```
 
-### Operating Modes
+`loopback` requires an adapter that supports loopback and, with `--matrix`, CAN FD. The `classic` and `fd` examples wait for traffic from a peer. Hardware coverage and remaining checks are recorded in [hardware validation](docs/HARDWARE_VALIDATION.md).
 
-```rust
-use gs_usb::*;
+## Development
 
-// Normal mode with hardware timestamps
-dev.start(GS_CAN_MODE_NORMAL | GS_CAN_MODE_HW_TIMESTAMP)?;
+The minimum declared Rust version is 1.85. Run formatting, Clippy, tests, and docs before publishing changes:
 
-// Listen-only mode (no ACKs)
-dev.start(GS_CAN_MODE_LISTEN_ONLY)?;
-
-// Loopback mode for testing
-dev.start(GS_CAN_MODE_LOOP_BACK)?;
-
-// CAN FD mode
-dev.start(GS_CAN_MODE_NORMAL | GS_CAN_MODE_FD)?;
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-features --all-targets -- -D warnings
+cargo test --all-features --all-targets
+cargo test --no-default-features
+cargo doc --all-features --no-deps
 ```
-
-### Frame Types
-
-```rust
-use gs_usb::{GsUsbFrame, CAN_EFF_FLAG, CAN_RTR_FLAG};
-
-// Standard frame (11-bit ID)
-let frame = GsUsbFrame::with_data(0x123, &[0x01, 0x02, 0x03]);
-
-// Extended frame (29-bit ID)
-let frame = GsUsbFrame::with_data(0x12345678 | CAN_EFF_FLAG, &data);
-
-// Remote transmission request
-let frame = GsUsbFrame::with_data(0x123 | CAN_RTR_FLAG, &[]);
-
-// CAN FD frame with BRS (bit rate switch)
-let frame = GsUsbFrame::with_fd_data(0x123, &data_64_bytes, true);
-```
-
-### Device Information
-
-```rust
-// Get device info (channels, firmware version)
-let info = dev.device_info()?;
-println!("Channels: {}", info.channel_count());
-println!("FW: {:.1}", info.firmware_version());
-
-// Get device capabilities
-let cap = dev.device_capability()?;
-println!("Clock: {:.1} MHz", cap.clock_mhz());
-println!("Features: 0x{:08x}", cap.feature);
-
-// Check CAN FD support
-if dev.supports_fd()? {
-    println!("CAN FD is supported");
-}
-
-// Get bus state and error counters
-if dev.supports_get_state()? {
-    let state = dev.get_state(0)?;
-    println!("State: {}", state.state_name());
-    println!("RX errors: {}", state.rxerr);
-    println!("TX errors: {}", state.txerr);
-}
-```
-
-## Linux Permissions
-
-To access USB devices without root on Linux, create a udev rule:
-
-```bash
-sudo tee /etc/udev/rules.d/99-gs_usb.rules << EOF
-# GS-USB devices
-SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="606f", MODE="0666"
-# candleLight
-SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="2323", MODE="0666"
-# CES CANext FD
-SUBSYSTEM=="usb", ATTR{idVendor}=="1cd2", ATTR{idProduct}=="606f", MODE="0666"
-# ABE CANdebugger FD
-SUBSYSTEM=="usb", ATTR{idVendor}=="16d0", ATTR{idProduct}=="10b8", MODE="0666"
-EOF
-
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-```
-
-## License
-
-MIT License
-
-## Acknowledgments
-
-This is a Rust port of the [Python gs_usb library](https://github.com/jxltom/gs_usb).

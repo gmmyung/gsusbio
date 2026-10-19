@@ -9,6 +9,7 @@ use crate::constants::{
     GS_USB_FRAME_SIZE_FD, GS_USB_FRAME_SIZE_FD_HW_TIMESTAMP, GS_USB_FRAME_SIZE_HW_TIMESTAMP,
     GS_USB_RX_ECHO_ID,
 };
+use crate::error::{GsUsbError, Result};
 
 /// Convert DLC to data length
 pub fn dlc_to_len(dlc: u8, fd: bool) -> usize {
@@ -216,29 +217,89 @@ impl GsUsbFrame {
         buf
     }
 
+    /// Encode a frame for host-to-device transfer. Timestamps are generated
+    /// by the adapter, so outgoing frames never contain a timestamp field.
+    pub(crate) fn pack_for_tx(&self, fd_mode: bool) -> Result<Vec<u8>> {
+        if self.is_fd() && !fd_mode {
+            return Err(GsUsbError::FdNotSupported);
+        }
+        if self.is_brs() && !self.is_fd() {
+            return Err(GsUsbError::InvalidFrame("BRS requires a CAN FD frame"));
+        }
+        if self.is_fd() && self.can_dlc > 15 {
+            return Err(GsUsbError::InvalidFrame("CAN FD DLC exceeds 15"));
+        }
+        if !self.is_fd() && self.can_dlc > 8 {
+            return Err(GsUsbError::InvalidFrame("classic CAN DLC exceeds 8"));
+        }
+        Ok(self.pack(false, fd_mode))
+    }
+
     /// Unpack received bytes into this frame
     ///
     /// # Arguments
     /// * `data` - Raw bytes received from device
     /// * `hw_timestamp` - Data includes timestamp field
     /// * `fd_mode` - CAN FD frame format (64-byte data)
-    pub fn unpack_from(&mut self, data: &[u8], hw_timestamp: bool, fd_mode: bool) {
+    ///
+    /// Returns an error if the frame is shorter than its header, declared
+    /// payload, or timestamp field.
+    pub fn unpack_from(&mut self, data: &[u8], hw_timestamp: bool, fd_mode: bool) -> Result<()> {
+        if data.len() < 12 {
+            return Err(GsUsbError::InvalidResponse {
+                expected: 12,
+                actual: data.len(),
+            });
+        }
+
+        let wire_fd = data[10] & GS_CAN_FLAG_FD != 0;
+        if wire_fd != fd_mode {
+            return Err(GsUsbError::InvalidFrame(
+                "FD flag does not match frame format",
+            ));
+        }
+        if fd_mode && data[8] > 15 {
+            return Err(GsUsbError::InvalidFrame("CAN FD DLC exceeds 15"));
+        }
+
+        let data_len = if fd_mode { 64 } else { 8 };
+        let echo_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let can_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let required_data =
+            if echo_id != GS_USB_RX_ECHO_ID || (!fd_mode && can_id & CAN_RTR_FLAG != 0) {
+                0
+            } else {
+                dlc_to_len(data[8], fd_mode)
+            };
+        // Timestamps follow the full 8- or 64-byte data field, even for
+        // short payloads and TX echo frames.
+        let expected = if hw_timestamp {
+            12 + data_len + 4
+        } else {
+            12 + required_data
+        };
+        if data.len() < expected {
+            return Err(GsUsbError::InvalidResponse {
+                expected,
+                actual: data.len(),
+            });
+        }
+
         // Header
-        self.echo_id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        self.can_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        self.echo_id = echo_id;
+        self.can_id = can_id;
         self.can_dlc = data[8];
         self.channel = data[9];
         self.flags = data[10];
         self.reserved = data[11];
 
         // Data
-        let data_len = if fd_mode { 64 } else { 8 };
         self.data = [0u8; CANFD_MAX_DLEN];
         let copy_len = data_len.min(data.len() - 12);
         self.data[..copy_len].copy_from_slice(&data[12..12 + copy_len]);
 
         // Timestamp
-        if hw_timestamp && data.len() >= 12 + data_len + 4 {
+        if hw_timestamp {
             let ts_offset = 12 + data_len;
             self.timestamp_us = u32::from_le_bytes([
                 data[ts_offset],
@@ -249,6 +310,7 @@ impl GsUsbFrame {
         } else {
             self.timestamp_us = 0;
         }
+        Ok(())
     }
 
     /// Create a new frame from received bytes
@@ -257,10 +319,12 @@ impl GsUsbFrame {
     /// * `data` - Raw bytes received from device
     /// * `hw_timestamp` - Data includes timestamp field
     /// * `fd_mode` - CAN FD frame format (64-byte data)
-    pub fn from_bytes(data: &[u8], hw_timestamp: bool, fd_mode: bool) -> Self {
+    ///
+    /// Returns an error for malformed or truncated frames.
+    pub fn from_bytes(data: &[u8], hw_timestamp: bool, fd_mode: bool) -> Result<Self> {
         let mut frame = Self::new();
-        frame.unpack_from(data, hw_timestamp, fd_mode);
-        frame
+        frame.unpack_from(data, hw_timestamp, fd_mode)?;
+        Ok(frame)
     }
 }
 
@@ -373,7 +437,7 @@ mod tests {
         let packed = frame.pack(false, false);
         assert_eq!(packed.len(), GS_USB_FRAME_SIZE);
 
-        let unpacked = GsUsbFrame::from_bytes(&packed, false, false);
+        let unpacked = GsUsbFrame::from_bytes(&packed, false, false).unwrap();
         assert_eq!(unpacked.can_id, frame.can_id);
         assert_eq!(unpacked.data(), frame.data());
     }
@@ -386,9 +450,90 @@ mod tests {
         let packed = frame.pack(true, true);
         assert_eq!(packed.len(), GS_USB_FRAME_SIZE_FD_HW_TIMESTAMP);
 
-        let unpacked = GsUsbFrame::from_bytes(&packed, true, true);
+        let unpacked = GsUsbFrame::from_bytes(&packed, true, true).unwrap();
         assert_eq!(unpacked.can_id, frame.can_id);
         assert_eq!(unpacked.flags, frame.flags);
         assert_eq!(unpacked.data(), frame.data());
+    }
+
+    #[test]
+    fn rejects_short_and_truncated_rx_frames() {
+        assert!(matches!(
+            GsUsbFrame::from_bytes(&[0; 11], false, false),
+            Err(GsUsbError::InvalidResponse {
+                expected: 12,
+                actual: 11
+            })
+        ));
+
+        let mut classic = GsUsbFrame::with_data(0x123, &[1, 2, 3, 4]);
+        classic.echo_id = GS_USB_RX_ECHO_ID;
+        let bytes = classic.pack(false, false);
+        assert!(matches!(
+            GsUsbFrame::from_bytes(&bytes[..14], false, false),
+            Err(GsUsbError::InvalidResponse {
+                expected: 16,
+                actual: 14
+            })
+        ));
+
+        let mut fd = GsUsbFrame::with_fd_data(0x123, &[1; 64], false);
+        fd.echo_id = GS_USB_RX_ECHO_ID;
+        let bytes = fd.pack(true, true);
+        assert!(matches!(
+            GsUsbFrame::from_bytes(&bytes[..76], true, true),
+            Err(GsUsbError::InvalidResponse {
+                expected: 80,
+                actual: 76
+            })
+        ));
+    }
+
+    #[test]
+    fn tx_frames_omit_timestamps_and_reject_fd_in_classic_mode() {
+        let classic = GsUsbFrame::with_data(0x123, &[1, 2, 3]);
+        assert_eq!(classic.pack_for_tx(false).unwrap().len(), GS_USB_FRAME_SIZE);
+
+        let fd = GsUsbFrame::with_fd_data(0x123, &[7; 64], true);
+        assert_eq!(fd.pack_for_tx(true).unwrap().len(), GS_USB_FRAME_SIZE_FD);
+        assert!(matches!(
+            fd.pack_for_tx(false),
+            Err(GsUsbError::FdNotSupported)
+        ));
+
+        let mut invalid = classic;
+        invalid.can_dlc = 9;
+        assert!(matches!(
+            invalid.pack_for_tx(false),
+            Err(GsUsbError::InvalidFrame("classic CAN DLC exceeds 8"))
+        ));
+    }
+
+    #[test]
+    fn accepts_short_echo_and_remote_frames() {
+        let echo = GsUsbFrame::with_data(0x123, &[1, 2, 3]);
+        let packed = echo.pack(false, false);
+        let unpacked = GsUsbFrame::from_bytes(&packed[..12], false, false).unwrap();
+        assert!(unpacked.is_echo_frame());
+        assert_eq!(unpacked.can_dlc, 3);
+
+        let mut remote = GsUsbFrame::with_data(0x123 | CAN_RTR_FLAG, &[]);
+        remote.echo_id = GS_USB_RX_ECHO_ID;
+        remote.can_dlc = 8;
+        let packed = remote.pack(false, false);
+        let unpacked = GsUsbFrame::from_bytes(&packed[..12], false, false).unwrap();
+        assert!(unpacked.is_remote_frame());
+        assert_eq!(unpacked.can_dlc, 8);
+    }
+
+    #[test]
+    fn reads_classic_hardware_timestamp_after_full_data_field() {
+        let mut frame = GsUsbFrame::with_data(0x123, &[0x42]);
+        frame.echo_id = GS_USB_RX_ECHO_ID;
+        frame.timestamp_us = 123_456;
+        let packed = frame.pack(true, false);
+        let unpacked = GsUsbFrame::from_bytes(&packed, true, false).unwrap();
+        assert_eq!(unpacked.data(), &[0x42]);
+        assert_eq!(unpacked.timestamp_us, 123_456);
     }
 }
