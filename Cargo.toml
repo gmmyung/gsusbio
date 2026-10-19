@@ -3,10 +3,13 @@ name = "gsusbio"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-authors = ["Maksim"]
+authors = ["Maksim Drachov", "Gyungmin Myung"]
 description = "Cross-platform async GS-USB CAN and CAN FD sockets"
 license = "MIT"
+readme = "README.md"
 repository = "https://github.com/gmmyung/gsusbio"
+documentation = "https://docs.rs/gsusbio"
+publish = ["crates-io"]
 keywords = ["can", "usb", "gs_usb", "candlelight", "canbus"]
 categories = ["hardware-support", "embedded"]
 
