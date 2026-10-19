@@ -1,6 +1,6 @@
 # USB setup
 
-`gsusbio` uses [nusb 0.2.8](https://docs.rs/nusb/0.2.8/nusb/) for both async and blocking operations. nusb is a Rust USB library and does not depend on libusb. There is no libusb package or native libusb development header to install for this crate.
+`gsusbio` uses [nusb 0.2.8](https://docs.rs/nusb/0.2.8/nusb/) for both async and blocking USB operations. Device access depends on the operating system.
 
 ## Linux
 
@@ -24,4 +24,4 @@ nusb uses IOKit. USB access normally needs no special permission setup. A device
 
 ## Diagnose discovery and connection
 
-`CanSocket::scan()` lists only the USB IDs in the [README](../README.md#features). An empty list means no supported device was discovered; it does not mean that libusb is missing. If discovery succeeds but `connect()` fails, check device permissions, driver binding, and whether another process has claimed the interface. An unsupported bitrate, mode, or FD request is reported separately by `connect()`.
+`CanSocket::scan()` lists only the USB IDs in the [README](../README.md#features). If discovery succeeds but `connect()` fails, check device permissions, driver binding, and whether another process has claimed the interface. An unsupported bitrate, mode, or FD request is reported separately by `connect()`.

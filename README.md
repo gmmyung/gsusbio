@@ -2,8 +2,6 @@
 
 Rust sockets for GS-USB Classic CAN and CAN FD adapters on Linux, macOS, and Windows. The USB backend is [nusb](https://docs.rs/nusb/0.2.8/nusb/). The default API uses Tokio; an optional blocking API uses the same backend.
 
-**No libusb installation is required.** nusb uses each operating system's USB interface. USB device permissions or a suitable driver may still be needed; see [USB setup](docs/USB_SETUP.md).
-
 ## Quick start
 
 Add the repository to your application:

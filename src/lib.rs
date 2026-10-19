@@ -2,7 +2,7 @@
 //!
 //! The default `tokio` feature provides `CanSocket` with a cloneable sender
 //! and an exclusive receiver. Enable `blocking` for `blocking::CanSocket`.
-//! Both APIs use nusb; neither requires libusb.
+//! Both APIs use nusb.
 //!
 //! Discover a supported adapter, configure a channel, and connect:
 //!
